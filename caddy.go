@@ -7,6 +7,7 @@ package redistransport
 
 import (
 	"strconv"
+	"time"
 
 	"github.com/caddyserver/caddy/v2"
 	"github.com/caddyserver/caddy/v2/caddyconfig/caddyfile"
@@ -26,6 +27,8 @@ type Redis struct {
 	Stream       string `json:"stream,omitempty"`
 	Size         int64  `json:"size,omitempty"`
 	HistoryLimit *int64 `json:"history_limit,omitempty"` // nil = default, 0 = replay disabled
+	// nil = DefaultCatchUpInterval, 0 = catch-up disabled (Pub/Sub only, best-effort)
+	CatchUpInterval *caddy.Duration `json:"catchup_interval,omitempty"`
 
 	transport    *RedisTransport
 	transportKey redisTransportKey
@@ -35,6 +38,7 @@ type Redis struct {
 type redisTransportKey struct {
 	hub, url, stream   string
 	size, historyLimit int64
+	catchUpInterval    time.Duration
 }
 
 func (Redis) CaddyModule() caddy.ModuleInfo {
@@ -54,8 +58,16 @@ func (r *Redis) Provision(ctx caddy.Context) error {
 		historyLimit = *r.HistoryLimit
 	}
 
+	catchUpInterval := DefaultCatchUpInterval
+	if r.CatchUpInterval != nil {
+		catchUpInterval = time.Duration(*r.CatchUpInterval)
+	}
+
 	hubName, _ := ctx.Value(mercurecaddy.HubNameContextKey).(string)
-	r.transportKey = redisTransportKey{hub: hubName, url: r.URL, stream: r.Stream, size: r.Size, historyLimit: historyLimit}
+	r.transportKey = redisTransportKey{
+		hub: hubName, url: r.URL, stream: r.Stream, size: r.Size,
+		historyLimit: historyLimit, catchUpInterval: catchUpInterval,
+	}
 
 	destructor, _, err := mercurecaddy.TransportUsagePool.LoadOrNew(r.transportKey, func() (caddy.Destructor, error) {
 		transport, err := NewRedisTransport(
@@ -65,6 +77,7 @@ func (r *Redis) Provision(ctx caddy.Context) error {
 			r.Stream,
 			r.Size,
 			historyLimit,
+			WithCatchUpInterval(catchUpInterval),
 		)
 
 		if err != nil {
@@ -125,6 +138,20 @@ func (r *Redis) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 					return d.Errf("history_limit must be >= 0, got %d", historyLimit)
 				}
 				r.HistoryLimit = &historyLimit
+
+			case "catchup_interval":
+				if !d.NextArg() {
+					return d.ArgErr()
+				}
+				interval, err := caddy.ParseDuration(d.Val())
+				if err != nil {
+					return d.WrapErr(err)
+				}
+				if interval < 0 {
+					return d.Errf("catchup_interval must be >= 0, got %s", d.Val())
+				}
+				catchUpInterval := caddy.Duration(interval)
+				r.CatchUpInterval = &catchUpInterval
 
 			default:
 				return d.Errf("unknown redis transport directive: %s", d.Val())

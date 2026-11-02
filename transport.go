@@ -33,6 +33,20 @@ type RedisTransport struct {
 	closedOnce   sync.Once
 	cancel       context.CancelFunc
 
+	// catchUpInterval is how often the stream is polled for updates that Pub/Sub
+	// did not deliver. 0 disables the catch-up loop (Pub/Sub only, best-effort).
+	catchUpInterval time.Duration
+
+	// delivered remembers the IDs of updates already handed to local subscribers,
+	// so an update seen both live (Pub/Sub or local Dispatch) and by the catch-up
+	// loop is delivered exactly once.
+	delivered *deliveredSet
+
+	// catchUpMutex serializes catch-up passes and guards streamCursor, the ID of
+	// the last stream entry examined by the catch-up loop.
+	catchUpMutex sync.Mutex
+	streamCursor string
+
 	mutex       sync.RWMutex
 	lastEventID string
 }
@@ -46,7 +60,26 @@ const (
 	trimInterval       = 10 * time.Second
 	pubsubReconnectMin = 500 * time.Millisecond
 	pubsubReconnectMax = 30 * time.Second
+
+	// DefaultCatchUpInterval bounds how late a cross-instance update can arrive
+	// when its Pub/Sub message was lost (network blip, Redis failover).
+	DefaultCatchUpInterval = 2 * time.Second
+
+	// deliveredSetSize must exceed the number of updates the whole cluster can
+	// publish during one catch-up interval, otherwise duplicates become possible.
+	deliveredSetSize = 10000
 )
+
+// Option customizes a RedisTransport.
+type Option func(*RedisTransport)
+
+// WithCatchUpInterval sets how often the stream is polled for updates missed by
+// Pub/Sub. 0 disables the catch-up loop.
+func WithCatchUpInterval(interval time.Duration) Option {
+	return func(t *RedisTransport) {
+		t.catchUpInterval = interval
+	}
+}
 
 func NewRedisTransport(
 	subscriberList *mercure.SubscriberList,
@@ -55,13 +88,14 @@ func NewRedisTransport(
 	stream string,
 	size int64,
 	historyLimit int64,
+	options ...Option,
 ) (*RedisTransport, error) {
-	options, err := redis.ParseURL(url)
+	redisOptions, err := redis.ParseURL(url)
 	if err != nil {
 		return nil, fmt.Errorf("invalid Redis URL %q: %w", url, err)
 	}
 
-	client := redis.NewClient(options)
+	client := redis.NewClient(redisOptions)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
@@ -89,13 +123,41 @@ func NewRedisTransport(
 		closed:       make(chan struct{}),
 		cancel:       listenCancel,
 		lastEventID:  mercure.EarliestLastEventID,
+
+		catchUpInterval: DefaultCatchUpInterval,
+		delivered:       newDeliveredSet(deliveredSetSize),
+	}
+
+	for _, option := range options {
+		option(t)
 	}
 
 	t.lastEventID = t.fetchLastEventID()
+
+	// Anchor the catch-up cursor BEFORE subscribing to Pub/Sub: anything published
+	// between this point and the SUBSCRIBE being active is then recovered from the
+	// stream instead of being lost.
+	t.streamCursor = t.fetchLatestStreamID(ctx)
+
 	go t.listenPubSub(listenCtx)
 	go t.trimLoop(listenCtx)
 
+	if t.catchUpInterval > 0 {
+		go t.catchUpLoop(listenCtx)
+	}
+
 	return t, nil
+}
+
+// fetchLatestStreamID returns the ID of the newest stream entry, or "0-0" when the
+// stream is empty or unreadable (the catch-up loop then starts from the beginning).
+func (t *RedisTransport) fetchLatestStreamID(ctx context.Context) string {
+	messages, err := t.client.XRevRangeN(ctx, t.stream, "+", "-", 1).Result()
+	if err != nil || len(messages) == 0 {
+		return "0-0"
+	}
+
+	return messages[0].ID
 }
 
 func generateInstanceID() string {
@@ -123,8 +185,12 @@ func (t *RedisTransport) fetchLastEventID() string {
 	return update.ID
 }
 
-// listenPubSub reconnects automatically on disconnect so cross-instance event
-// distribution survives transient Redis failures (network blips, failovers).
+// listenPubSub delivers live updates from other instances.
+//
+// It is NOT the recovery mechanism: go-redis reconnects a PubSub transparently and
+// only closes its message channel when the client itself is closed, so a network
+// blip or a Redis failover silently drops the messages published meanwhile without
+// this loop ever noticing. Missed updates are recovered by catchUpLoop instead.
 func (t *RedisTransport) listenPubSub(ctx context.Context) {
 	backoff := pubsubReconnectMin
 
@@ -145,9 +211,9 @@ func (t *RedisTransport) listenPubSub(ctx context.Context) {
 				slog.Duration("backoff", backoff))
 		}
 
-		// Replay events that landed in the stream while pub/sub was disconnected,
-		// so existing subscribers don't miss cross-instance dispatches.
-		t.replayMissedEvents(ctx)
+		// Recover what landed in the stream while Pub/Sub was down, without waiting
+		// for the next catch-up tick.
+		t.catchUp(ctx)
 
 		if wasHealthy {
 			backoff = pubsubReconnectMin
@@ -157,37 +223,47 @@ func (t *RedisTransport) listenPubSub(ctx context.Context) {
 	}
 }
 
-// replayMissedEvents dispatches events that landed in the stream after lastEventID
-// to local subscribers. The anchor is resolved via the index in O(1). If it can no
-// longer be anchored (trimmed), it fast-forwards to the latest entry rather than
-// reading the whole stream to locate it.
-func (t *RedisTransport) replayMissedEvents(ctx context.Context) {
-	t.mutex.RLock()
-	replayAfterID := t.lastEventID
-	t.mutex.RUnlock()
-
-	if replayAfterID == mercure.EarliestLastEventID {
-		return
-	}
-
-	cursor, found := t.resolveStreamCursor(ctx, replayAfterID)
-	if !found {
-		t.fastForwardLastEventID(ctx, replayAfterID)
-		return
-	}
+// catchUpLoop periodically delivers stream entries that never reached this
+// instance through Pub/Sub. The stream is the source of truth; Pub/Sub is only the
+// low-latency path.
+func (t *RedisTransport) catchUpLoop(ctx context.Context) {
+	ticker := time.NewTicker(t.catchUpInterval)
+	defer ticker.Stop()
 
 	for {
-		messages, err := t.client.XRangeN(ctx, t.stream, cursor, "+", historyPageSize).Result()
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			t.catchUp(ctx)
+		}
+	}
+}
+
+// catchUp reads every stream entry after streamCursor and delivers to local
+// subscribers the ones not delivered yet (by Pub/Sub or by a local Dispatch).
+//
+// The cursor is a Redis stream ID, which Redis assigns monotonically, so no entry
+// can appear behind it: unlike an anchor on the last delivered Mercure event ID,
+// it cannot skip an entry that Pub/Sub delivered out of stream order. If the
+// cursor was trimmed away, XRANGE simply resumes from the oldest entry left.
+func (t *RedisTransport) catchUp(ctx context.Context) {
+	t.catchUpMutex.Lock()
+	defer t.catchUpMutex.Unlock()
+
+	for {
+		messages, err := t.client.XRangeN(ctx, t.stream, "("+t.streamCursor, "+", historyPageSize).Result()
 		if err != nil {
-			t.logger.LogAttrs(ctx, slog.LevelError, "Failed to replay missed events from stream", slog.Any("error", err))
+			if ctx.Err() == nil {
+				t.logger.LogAttrs(ctx, slog.LevelWarn, "Unable to read Redis Stream for catch-up, will retry", slog.Any("error", err))
+			}
+
 			return
 		}
 
-		if len(messages) == 0 {
-			break
-		}
-
 		for _, message := range messages {
+			t.streamCursor = message.ID
+
 			data, ok := message.Values["data"].(string)
 			if !ok {
 				continue
@@ -195,40 +271,35 @@ func (t *RedisTransport) replayMissedEvents(ctx context.Context) {
 
 			var update mercure.Update
 			if err := json.Unmarshal([]byte(data), &update); err != nil {
+				t.logger.LogAttrs(ctx, slog.LevelError, "Unable to unmarshal update from Redis Stream during catch-up", slog.Any("error", err))
+
 				continue
 			}
 
-			t.mutex.Lock()
-			t.lastEventID = update.ID
-			t.mutex.Unlock()
-
-			for _, subscriber := range t.subscribers.MatchAny(&update) {
-				subscriber.Dispatch(ctx, &update, false)
-			}
+			t.deliverLocally(ctx, &update)
 		}
 
 		if int64(len(messages)) < historyPageSize {
-			break
+			return
 		}
-
-		cursor = "(" + messages[len(messages)-1].ID
 	}
 }
 
-// fastForwardLastEventID advances lastEventID to the latest stream entry without
-// dispatching, used when the previous anchor is no longer present in the stream.
-func (t *RedisTransport) fastForwardLastEventID(ctx context.Context, missingID string) {
-	t.logger.LogAttrs(ctx, slog.LevelWarn, "lastEventID not found in stream (likely trimmed), fast-forwarding to latest",
-		slog.String("lastEventID", missingID))
-
-	latestEventID := t.fetchLastEventID()
-	if latestEventID == mercure.EarliestLastEventID {
+// deliverLocally hands an update to the subscribers connected to this instance,
+// unless it was already delivered. It is the single delivery path shared by
+// Dispatch, Pub/Sub and the catch-up loop.
+func (t *RedisTransport) deliverLocally(ctx context.Context, update *mercure.Update) {
+	if !t.delivered.add(update.ID) {
 		return
 	}
 
 	t.mutex.Lock()
-	t.lastEventID = latestEventID
+	t.lastEventID = update.ID
 	t.mutex.Unlock()
+
+	for _, subscriber := range t.subscribers.MatchAny(update) {
+		subscriber.Dispatch(ctx, update, false)
+	}
 }
 
 // subscribePubSub returns true if at least one message was received (= healthy connection).
@@ -274,13 +345,7 @@ func (t *RedisTransport) subscribePubSub(ctx context.Context) (received bool) {
 				continue
 			}
 
-			t.mutex.Lock()
-			t.lastEventID = message.Update.ID
-			t.mutex.Unlock()
-
-			for _, subscriber := range t.subscribers.MatchAny(message.Update) {
-				subscriber.Dispatch(ctx, message.Update, false)
-			}
+			t.deliverLocally(ctx, message.Update)
 		}
 	}
 }
@@ -405,6 +470,24 @@ func (t *RedisTransport) Dispatch(ctx context.Context, update *mercure.Update) e
 
 	update.AssignUUID()
 
+	// Local subscribers are served first and unconditionally: Redis only carries
+	// the update to the OTHER instances, so a Redis outage must degrade to
+	// single-instance delivery instead of failing the publish. Delivering first
+	// also marks the update as delivered before it is in the stream, so the
+	// catch-up loop can never hand it out a second time.
+	t.deliverLocally(ctx, update)
+
+	if err := t.propagate(ctx, update); err != nil {
+		t.logger.LogAttrs(ctx, slog.LevelError, "Unable to propagate update through Redis, delivered to this instance only",
+			slog.String("update.id", update.ID), slog.Any("error", err))
+	}
+
+	return nil
+}
+
+// propagate stores the update in the shared stream (history, catch-up) and
+// announces it on Pub/Sub (low-latency path to the other instances).
+func (t *RedisTransport) propagate(ctx context.Context, update *mercure.Update) error {
 	updateJSON, err := json.Marshal(*update)
 	if err != nil {
 		return fmt.Errorf("error when marshaling update: %w", err)
@@ -418,27 +501,22 @@ func (t *RedisTransport) Dispatch(ctx context.Context, update *mercure.Update) e
 		return fmt.Errorf("error adding to Redis Stream: %w", err)
 	}
 
-	// Index event UUID → stream ID for O(1) lookups in replay/history.
-	t.client.HSet(ctx, t.indexKey, update.ID, streamID) //nolint:errcheck
+	// Index event UUID → stream ID for O(1) lookups in history replay.
+	if err := t.client.HSet(ctx, t.indexKey, update.ID, streamID).Err(); err != nil {
+		t.logger.LogAttrs(ctx, slog.LevelWarn, "Unable to index update, history replay from it will fast-forward",
+			slog.String("update.id", update.ID), slog.Any("error", err))
+	}
 
 	pubsubPayload, err := json.Marshal(pubsubMessage{InstanceID: t.instanceID, Update: update})
 	if err != nil {
 		return fmt.Errorf("error when marshaling pub/sub message: %w", err)
 	}
 
-	// Pub/Sub is best-effort. The event is already persisted in the stream,
-	// so other instances catch up via history even if this publish fails.
+	// Pub/Sub is best-effort: the update is in the stream, so the other instances
+	// pick it up on their next catch-up pass if this message is lost.
 	if err := t.client.Publish(ctx, t.channel, string(pubsubPayload)).Err(); err != nil {
-		t.logger.LogAttrs(ctx, slog.LevelError, "Failed to publish to Redis Pub/Sub (event persisted in stream)",
+		t.logger.LogAttrs(ctx, slog.LevelWarn, "Failed to publish to Redis Pub/Sub, other instances will catch up from the stream",
 			slog.Any("error", err))
-	}
-
-	t.mutex.Lock()
-	t.lastEventID = update.ID
-	t.mutex.Unlock()
-
-	for _, subscriber := range t.subscribers.MatchAny(update) {
-		subscriber.Dispatch(ctx, update, false)
 	}
 
 	return nil
