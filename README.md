@@ -5,8 +5,9 @@ A [Redis](https://redis.io) transport for the [Mercure](https://mercure.rocks) h
 
 The open-source Mercure hub ships single-process transports (`local`, `bolt`), so a horizontally
 scaled hub cannot deliver an update published on one instance to subscribers connected to another.
-This module fixes that. Redis Streams hold the event history, Redis Pub/Sub fans out to the other
-instances, and a UUID → stream-ID index keeps `Last-Event-ID` replay O(1).
+This module fixes that. Redis Streams hold the event history and are the source of truth, Redis
+Pub/Sub fans out to the other instances with low latency, a periodic catch-up pass over the stream
+delivers whatever Pub/Sub missed, and a UUID → stream-ID index keeps `Last-Event-ID` replay O(1).
 
 Requires Redis 5.0 or newer, for Redis Streams. Supported Go, Caddy, and Mercure versions are the
 ones declared in [`go.mod`](./go.mod). The configuration surface is stable as of 1.0.0 and follows
@@ -33,6 +34,7 @@ localhost {
                 stream mercure
                 size 10000
                 history_limit 1000
+                catchup_interval 2s
             }
 
             issuer https://example.com {
@@ -56,6 +58,11 @@ localhost {
 | `stream` | `mercure` | Stream key. Also derives the Pub/Sub channel (`<stream>:pubsub`) and index hash (`<stream>:index`). |
 | `size` | `0` | Max stream entries, enforced by a background `XTRIM` every 10s. **`0` means no trimming, so the stream grows without bound.** Set this. |
 | `history_limit` | `1000` | Max entries read per SSE history replay. `0` disables replay, so subscribers fast-forward to live. |
+| `catchup_interval` | `2s` | How often each instance reads the stream for updates its Pub/Sub connection missed (network blip, failover). It bounds how late such an update arrives. `0` disables it, leaving cross-instance delivery best-effort. |
+
+Set client timeouts in the URL, e.g. `redis://host:6379/0?dial_timeout=1s&read_timeout=1s&write_timeout=1s&max_retries=1`.
+The go-redis defaults (5s dial, 3s read, 3 retries) can hold a publish request for several seconds
+when Redis stops answering.
 
 Size the stream to cover your longest expected client disconnect at peak event rate. There is no TTL
 and no eviction fallback, so `size` is the only bound on Redis memory. `Last-Event-ID` is
@@ -79,9 +86,15 @@ Run Redis with AUTH/ACLs and TLS, and do not share the instance with untrusted w
 - `history_limit` bounds the client-facing path only. Internal gap recovery after a Pub/Sub outage may
   dispatch up to `size` events at once. The anchor is server-controlled, so this is not
   client-triggerable.
-- The transport cannot signal Mercure that Redis is unreachable. While Pub/Sub is down, local delivery
-  continues but instances diverge until reconnect and replay.
-- Pub/Sub delivery is best-effort. Consistency comes from the stream plus replay, not the channel.
+- When Redis is unreachable, a publish still succeeds and reaches the subscribers of the instance it
+  was published on. It never reaches the other instances, because it never made it into the stream.
+  The failure is logged at error level.
+- Pub/Sub delivery is best-effort. go-redis reconnects a Pub/Sub connection transparently and drops
+  what was published meanwhile, so consistency comes from the catch-up pass over the stream, not from
+  the channel. An update whose Pub/Sub message was lost reaches remote subscribers up to
+  `catchup_interval` late.
+- Duplicate suppression remembers the last 10,000 delivered update IDs per instance. Publishing more
+  than that across the cluster within one `catchup_interval` can deliver an update twice.
 
 ## Development
 
